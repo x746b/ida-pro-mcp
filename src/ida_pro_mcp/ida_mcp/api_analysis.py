@@ -1,6 +1,7 @@
 from itertools import islice
 import struct
 from typing import Annotated, Optional
+import ida_hexrays
 import ida_lines
 import ida_funcs
 import idaapi
@@ -9,11 +10,11 @@ import ida_typeinf
 import ida_nalt
 import ida_bytes
 import ida_ida
+import ida_entry
 import ida_idaapi
 import ida_xref
 import ida_ua
 import ida_name
-import ida_idp
 from .rpc import tool
 from .sync import idasync, tool_timeout
 from .utils import (
@@ -26,11 +27,13 @@ from .utils import (
     get_assembly_lines,
     get_all_xrefs,
     get_all_comments,
+    Function,
     Argument,
     DisassemblyFunction,
     Xref,
     BasicBlock,
     StructFieldQuery,
+    InsnPattern,
 )
 
 # ============================================================================
@@ -38,6 +41,22 @@ from .utils import (
 # ============================================================================
 
 _IMM_SCAN_BACK_MAX = 15
+
+
+def _raw_bin_search(ea: int, max_ea: int, data: bytes, mask: bytes, flags: int = 0) -> int:
+    """Search for raw bytes with mask, compatible across IDA versions.
+
+    Returns the match address, or idaapi.BADADDR if not found.
+    """
+    if hasattr(ida_bytes, 'find_bytes'):
+        # IDA 9.0+: high-level API accepting bytes + mask directly
+        search_flags = flags or (ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW)
+        return ida_bytes.find_bytes(data, ea, range_end=max_ea, mask=mask, flags=search_flags)
+    if hasattr(ida_bytes, 'bin_search'):
+        # Older IDA: low-level 6-param API
+        search_flags = flags or (ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW)
+        return ida_bytes.bin_search(ea, max_ea, data, mask, len(data), search_flags)
+    raise RuntimeError("No binary search API available (tried ida_bytes.find_bytes, ida_bytes.bin_search)")
 
 
 def _decode_insn_at(ea: int) -> ida_ua.insn_t | None:
@@ -144,7 +163,6 @@ def _resolve_immediate_insn_start(
                 return start
     return None
 
-
 # ============================================================================
 # Code Analysis & Decompilation
 # ============================================================================
@@ -187,6 +205,7 @@ def disasm(
         max_instructions = 50000
     if offset < 0:
         offset = 0
+
 
     try:
         start = parse_address(addr)
@@ -296,7 +315,11 @@ def disasm(
             "asm": out,
             "instruction_count": len(lines),
             "total_instructions": total_count if include_total else None,
-            "cursor": ({"next": offset + max_instructions} if more else {"done": True}),
+            "cursor": (
+                {"next": offset + max_instructions}
+                if more
+                else {"done": True}
+            ),
         }
     except Exception as e:
         return {
@@ -478,8 +501,7 @@ def callees(
                         break
                     current_ea = next_ea
                     continue
-                # Use architecture-independent call instruction detection
-                if ida_idp.is_call_insn(insn):
+                if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
                     op0 = insn.ops[0]
                     if op0.type in (ida_ua.o_mem, ida_ua.o_near, ida_ua.o_far):
                         target = op0.addr
@@ -505,13 +527,11 @@ def callees(
                     break
                 current_ea = next_ea
 
-            results.append(
-                {
-                    "addr": fn_addr,
-                    "callees": list(callees_dict.values()),
-                    "more": more,
-                }
-            )
+            results.append({
+                "addr": fn_addr,
+                "callees": list(callees_dict.values()),
+                "more": more,
+            })
         except Exception as e:
             results.append({"addr": fn_addr, "callees": None, "error": str(e)})
 
@@ -539,24 +559,68 @@ def find_bytes(
     if limit <= 0 or limit > 10000:
         limit = 10000
 
+    # Build a reusable search closure based on available IDA API
+    _use_find_bytes = hasattr(ida_bytes, 'find_bytes')
+    _use_bin_search = hasattr(ida_bytes, 'bin_search')
+
+    def _make_searcher(pattern: str):
+        """Return a (searcher_fn, error_str|None) for the given pattern.
+
+        searcher_fn(ea, max_ea) -> ea_t  (BADADDR if not found)
+        """
+        tokens = pattern.strip().split()
+        if not tokens:
+            return None, "Empty pattern"
+
+        if _use_find_bytes:
+            # IDA 9.0+ high-level API: accepts pattern string directly.
+            # Normalize "??" to "?" (IDA uses single ? per wildcard byte).
+            normalized = " ".join(
+                "?" if t in ("??", "?") else t for t in tokens
+            )
+
+            def _search(ea, max_ea):
+                return ida_bytes.find_bytes(normalized, ea, range_end=max_ea)
+
+            return _search, None
+
+        if _use_bin_search:
+            # Older IDA: manual parse into bytes + mask
+            pat = bytearray()
+            msk = bytearray()
+            for t in tokens:
+                if t in ("??", "?"):
+                    pat.append(0)
+                    msk.append(0)
+                else:
+                    pat.append(int(t, 16))
+                    msk.append(0xFF)
+            data = bytes(pat)
+            mask = bytes(msk)
+            flags = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
+
+            def _search(ea, max_ea):
+                return ida_bytes.bin_search(ea, max_ea, data, mask, len(data), flags)
+
+            return _search, None
+
+        return None, "No binary search API available (tried ida_bytes.find_bytes, ida_bytes.bin_search)"
+
     results = []
     for pattern in patterns:
         matches = []
         skipped = 0
         more = False
         try:
-            # Parse the pattern
-            compiled = ida_bytes.compiled_binpat_vec_t()
-            err = ida_bytes.parse_binpat_str(
-                compiled, ida_ida.inf_get_min_ea(), pattern, 16
-            )
-            if err:
+            searcher, build_err = _make_searcher(pattern)
+            if build_err is not None:
                 results.append(
                     {
                         "pattern": pattern,
                         "matches": [],
                         "n": 0,
                         "cursor": {"done": True},
+                        "error": build_err,
                     }
                 )
                 continue
@@ -565,24 +629,30 @@ def find_bytes(
             ea = ida_ida.inf_get_min_ea()
             max_ea = ida_ida.inf_get_max_ea()
             while ea != idaapi.BADADDR:
-                ea = ida_bytes.bin_search(
-                    ea, max_ea, compiled, ida_bytes.BIN_SEARCH_FORWARD
-                )
-                if ea != idaapi.BADADDR:
-                    if skipped < offset:
-                        skipped += 1
-                    else:
-                        matches.append(hex(ea))
-                        if len(matches) >= limit:
-                            # Check if there's more
-                            next_ea = ida_bytes.bin_search(
-                                ea + 1, max_ea, compiled, ida_bytes.BIN_SEARCH_FORWARD
-                            )
-                            more = next_ea != idaapi.BADADDR
-                            break
-                    ea += 1
-        except Exception:
-            pass
+                ea = searcher(ea, max_ea)
+                if ea == idaapi.BADADDR:
+                    break
+                if skipped < offset:
+                    skipped += 1
+                else:
+                    matches.append(hex(ea))
+                    if len(matches) >= limit:
+                        # Check if there's more
+                        next_ea = searcher(ea + 1, max_ea)
+                        more = next_ea != idaapi.BADADDR
+                        break
+                ea += 1
+        except Exception as e:
+            results.append(
+                {
+                    "pattern": pattern,
+                    "matches": [],
+                    "n": 0,
+                    "cursor": {"done": True},
+                    "error": str(e),
+                }
+            )
+            continue
 
         results.append(
             {
@@ -726,25 +796,17 @@ def find(
             try:
                 ea = ida_ida.inf_get_min_ea()
                 max_ea = ida_ida.inf_get_max_ea()
-                mask = b"\xff" * len(pattern_bytes)
-                flags = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
+                mask = b"\xFF" * len(pattern_bytes)
                 while ea != idaapi.BADADDR:
-                    ea = ida_bytes.bin_search(
-                        ea, max_ea, pattern_bytes, mask, len(pattern_bytes), flags
-                    )
+                    ea = _raw_bin_search(ea, max_ea, pattern_bytes, mask)
                     if ea != idaapi.BADADDR:
                         if skipped < offset:
                             skipped += 1
                         else:
                             matches.append(hex(ea))
                             if len(matches) >= limit:
-                                next_ea = ida_bytes.bin_search(
-                                    ea + 1,
-                                    max_ea,
-                                    pattern_bytes,
-                                    mask,
-                                    len(pattern_bytes),
-                                    flags,
+                                next_ea = _raw_bin_search(
+                                    ea + 1, max_ea, pattern_bytes, mask
                                 )
                                 more = next_ea != idaapi.BADADDR
                                 break
@@ -796,13 +858,8 @@ def find(
                     for normalized, size, pattern_bytes in candidates:
                         ea = seg.start_ea
                         while ea != idaapi.BADADDR and ea < seg.end_ea:
-                            ea = ida_bytes.bin_search(
-                                ea,
-                                seg.end_ea,
-                                pattern_bytes,
-                                b"\xff" * size,
-                                size,
-                                ida_bytes.BIN_SEARCH_FORWARD,
+                            ea = _raw_bin_search(
+                                ea, seg.end_ea, pattern_bytes, b"\xFF" * size
                             )
                             if ea == idaapi.BADADDR:
                                 break
@@ -921,9 +978,7 @@ def find(
     return results
 
 
-def _resolve_insn_scan_ranges(
-    pattern: dict, allow_broad: bool
-) -> tuple[list[tuple[int, int]], str | None]:
+def _resolve_insn_scan_ranges(pattern: dict, allow_broad: bool) -> tuple[list[tuple[int, int]], str | None]:
     func_addr = pattern.get("func")
     segment_name = pattern.get("segment")
     start_s = pattern.get("start")
@@ -1149,12 +1204,8 @@ def callgraph(
         list[str] | str, "Root function addresses to start call graph traversal from"
     ],
     max_depth: Annotated[int, "Maximum depth for call graph traversal"] = 5,
-    max_nodes: Annotated[
-        int, "Max nodes across the graph (default: 1000, max: 100000)"
-    ] = 1000,
-    max_edges: Annotated[
-        int, "Max edges across the graph (default: 5000, max: 200000)"
-    ] = 5000,
+    max_nodes: Annotated[int, "Max nodes across the graph (default: 1000, max: 100000)"] = 1000,
+    max_edges: Annotated[int, "Max edges across the graph (default: 5000, max: 200000)"] = 5000,
     max_edges_per_func: Annotated[
         int, "Max edges per function (default: 200, max: 5000)"
     ] = 200,
